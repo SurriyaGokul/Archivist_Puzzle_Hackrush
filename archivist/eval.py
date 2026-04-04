@@ -56,6 +56,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--rerank_device", help="Force reranker device (e.g. 'cuda' or 'cpu')")
     p.add_argument("--w_rerank", type=float, help="Weight for reranker feature")
 
+    p.add_argument("--w_entity", type=float, help="Weight for named-entity flow feature")
+    p.add_argument("--entity_window", type=int, help="Words to scan at tail/head for entity detection")
+    p.add_argument("--no_balance", action="store_true", help="Disable chapter balance enforcement")
+
     p.add_argument("--refine_window", type=int, help="Sliding-window exact refinement (0 disables)")
     p.add_argument("--refine_passes", type=int, help="Refinement passes")
 
@@ -145,6 +149,13 @@ def main() -> None:
         cfg.rerank_device = args.rerank_device
     if args.w_rerank is not None:
         cfg.w_rerank = float(args.w_rerank)
+
+    if args.w_entity is not None:
+        cfg.w_entity = float(args.w_entity)
+    if args.entity_window is not None:
+        cfg.entity_window = int(args.entity_window)
+    if args.no_balance:
+        cfg.assign_balance = False
 
     if args.refine_window is not None:
         cfg.refine_window = int(args.refine_window)

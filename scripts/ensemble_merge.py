@@ -25,6 +25,7 @@ def _parse_args() -> argparse.Namespace:
         help="Comma-separated directories, each containing BookA.csv and BookB.csv",
     )
     p.add_argument("--out_dir", required=True, help="Directory to write merged BookA.csv and BookB.csv")
+    p.add_argument("--method", choices=["borda", "kemeny"], default="kemeny", help="Consensus method")
     return p.parse_args()
 
 
@@ -62,6 +63,92 @@ def _borda_consensus(orders: list[list[int]]) -> list[int]:
     return sorted(pages, key=lambda pid: (rank_sum[pid], pid))
 
 
+def _kemeny_consensus(orders: list[list[int]]) -> list[int]:
+    """Kemeny-optimal consensus: minimize total Kendall tau distance to all inputs.
+
+    Builds a pairwise majority matrix and solves it as a TSP using OR-Tools.
+    Falls back to Borda if OR-Tools unavailable.
+    """
+    if not orders:
+        raise ValueError("No orders provided")
+
+    n = len(orders[0])
+    pages = sorted(set(orders[0]))
+    pid_to_idx = {pid: i for i, pid in enumerate(pages)}
+
+    for o in orders:
+        if len(o) != n or set(o) != set(pages):
+            raise ValueError("All orders must be permutations of the same page set")
+
+    # Build pairwise majority matrix: M[i,j] = number of orders where page i precedes page j.
+    import numpy as np
+
+    majority = np.zeros((n, n), dtype=np.float32)
+    for o in orders:
+        pos = {pid: r for r, pid in enumerate(o)}
+        for i in range(n):
+            for j in range(i + 1, n):
+                pi, pj = pages[i], pages[j]
+                if pos[pi] < pos[pj]:
+                    majority[i, j] += 1.0
+                else:
+                    majority[j, i] += 1.0
+
+    # Use majority as edge weights and solve TSP to find the ordering
+    # that maximizes agreement with the majority of input orderings.
+    try:
+        from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+
+        # Find best start: node with highest total outgoing majority.
+        start = int(np.argmax(majority.sum(axis=1)))
+
+        end = n
+        n_total = n + 1
+        w_max = float(np.max(majority))
+        scale = 10000.0
+
+        def cost(i: int, j: int) -> int:
+            big_m = int(1e9)
+            if i == end:
+                return big_m
+            if j == end:
+                return 0
+            if i == j:
+                return big_m
+            return int(round((w_max - float(majority[i, j])) * scale))
+
+        manager = pywrapcp.RoutingIndexManager(n_total, 1, start, end)
+        routing = pywrapcp.RoutingModel(manager)
+
+        def cb(from_index: int, to_index: int) -> int:
+            return cost(manager.IndexToNode(from_index), manager.IndexToNode(to_index))
+
+        transit_cb = routing.RegisterTransitCallback(cb)
+        routing.SetArcCostEvaluatorOfAllVehicles(transit_cb)
+
+        params = pywrapcp.DefaultRoutingSearchParameters()
+        params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+        params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+        params.time_limit.seconds = 30
+
+        solution = routing.SolveWithParameters(params)
+        if solution is None:
+            return _borda_consensus(orders)
+
+        index = routing.Start(0)
+        route: list[int] = []
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            if node != end:
+                route.append(node)
+            index = solution.Value(routing.NextVar(index))
+
+        return [pages[i] for i in route]
+
+    except ImportError:
+        return _borda_consensus(orders)
+
+
 def main() -> None:
     args = _parse_args()
     in_dirs = [Path(x.strip()) for x in args.in_dirs.split(",") if x.strip()]
@@ -71,6 +158,8 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    consensus_fn = _kemeny_consensus if args.method == "kemeny" else _borda_consensus
+
     for book in ["BookA", "BookB"]:
         orders: list[list[int]] = []
         for d in in_dirs:
@@ -79,7 +168,7 @@ def main() -> None:
                 raise FileNotFoundError(csv_path)
             orders.append(_read_order(csv_path))
 
-        merged = _borda_consensus(orders)
+        merged = consensus_fn(orders)
         write_submission(merged, out_dir / f"{book}.csv")
         print(f"wrote {out_dir / f'{book}.csv'}")
 

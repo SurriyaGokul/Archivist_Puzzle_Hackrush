@@ -10,6 +10,7 @@ from archivist.cache import SQLiteScoreCache
 from archivist.config import SolverConfig
 from archivist.data import normalize_text, word_window
 from archivist.embeddings import Embedder, cosine_sim_matrix, spectral_seriation
+from archivist.entities import auto_detect_characters, character_flow_matrix
 from archivist.heuristics import boundary_overlap_matrix
 from archivist.lm import LMConfig, LMScorer
 from archivist.rerank import RerankConfig, Reranker
@@ -42,6 +43,9 @@ def solve_pages(pages: list[Page], *, config: SolverConfig, cache_dir: str | Pat
     head_emb = embedder.encode(head_text)
     tail_emb = embedder.encode(tail_text)
 
+    # Named entity detection.
+    characters = auto_detect_characters(pages) if config.w_entity > 0 else []
+
     # Bucketing.
     if anchors_sorted:
         next_anchor_by_chapter: dict[int, int | None] = {}
@@ -57,6 +61,8 @@ def solve_pages(pages: list[Page], *, config: SolverConfig, cache_dir: str | Pat
             knn=config.spectral_knn,
             dp_penalty=config.assign_dp_penalty,
         )
+        if config.assign_balance:
+            buckets = _balance_buckets(buckets, pages, full_emb, anchors_sorted)
         ordered_chapter_keys: list[int | str] = ["__pre__", *[a.chapter_num for a in anchors_sorted], "__post__"]
     else:
         # No anchors: single bucket.
@@ -114,6 +120,7 @@ def solve_pages(pages: list[Page], *, config: SolverConfig, cache_dir: str | Pat
             head_emb=head_emb,
             tail_emb=tail_emb,
             full_text=full_text,
+            characters=characters,
             config=config,
             scorers=scorers,
             rerankers=rerankers,
@@ -128,6 +135,87 @@ def solve_pages(pages: list[Page], *, config: SolverConfig, cache_dir: str | Pat
         raise RuntimeError("Solver produced invalid permutation")
 
     return out_order
+
+
+def _balance_buckets(
+    buckets: dict[int | str, list[int]],
+    pages: list[Page],
+    full_emb: np.ndarray,
+    anchors: list[Anchor],
+) -> dict[int | str, list[int]]:
+    """Enforce balanced chapter sizes by moving outlier pages to neighbor chapters."""
+
+    anchor_ids = {a.page_id for a in anchors}
+    chapter_keys = [k for k in buckets if isinstance(k, int)]
+    if len(chapter_keys) < 2:
+        return buckets
+
+    id_to_pos = {p.page_id: i for i, p in enumerate(pages)}
+
+    # Compute expected size (excluding anchors from the count).
+    total_non_anchor = sum(
+        len([pid for pid in buckets.get(k, []) if pid not in anchor_ids])
+        for k in list(buckets.keys())
+    )
+    expected = total_non_anchor / max(1, len(chapter_keys))
+    min_size = max(2, int(expected * 0.3))
+    max_size = int(expected * 2.5)
+
+    for _ in range(10):
+        changed = False
+        for ck in chapter_keys:
+            pids = buckets.get(ck, [])
+            if len(pids) <= max_size:
+                continue
+
+            # Compute centroid of this chapter.
+            positions = [id_to_pos[pid] for pid in pids]
+            centroid = full_emb[positions].mean(axis=0, keepdims=True)
+            centroid = centroid / max(1e-12, float(np.linalg.norm(centroid)))
+
+            # Similarity of each page to centroid.
+            sims = (full_emb[positions] @ centroid.T).flatten()
+
+            # Sort non-anchor pages by similarity (ascending = furthest first).
+            candidates = [
+                (float(sims[i]), pids[i])
+                for i in range(len(pids))
+                if pids[i] not in anchor_ids
+            ]
+            candidates.sort()
+
+            # Move furthest pages to nearest undersized neighbor.
+            overflow = len(pids) - max_size
+            for _, pid in candidates[:overflow]:
+                pos = id_to_pos[pid]
+                page_emb = full_emb[pos : pos + 1]
+
+                best_key = None
+                best_sim = -np.inf
+                for other_ck in chapter_keys:
+                    if other_ck == ck:
+                        continue
+                    if len(buckets.get(other_ck, [])) >= max_size:
+                        continue
+                    other_positions = [id_to_pos[p] for p in buckets.get(other_ck, [])]
+                    if not other_positions:
+                        continue
+                    other_centroid = full_emb[other_positions].mean(axis=0, keepdims=True)
+                    other_centroid = other_centroid / max(1e-12, float(np.linalg.norm(other_centroid)))
+                    s = float((page_emb @ other_centroid.T).item())
+                    if s > best_sim:
+                        best_sim = s
+                        best_key = other_ck
+
+                if best_key is not None:
+                    buckets[ck].remove(pid)
+                    buckets[best_key].append(pid)
+                    changed = True
+
+        if not changed:
+            break
+
+    return buckets
 
 
 def _assign_to_chapters_spectral(
@@ -385,6 +473,7 @@ def _order_bucket(
     head_emb: np.ndarray,
     tail_emb: np.ndarray,
     full_text: list[str],
+    characters: list[str],
     config: SolverConfig,
     scorers: list[LMScorer],
     rerankers: list[Reranker],
@@ -425,7 +514,17 @@ def _order_bucket(
     else:
         overlap_norm = overlap
 
-    cheap = (config.w_emb * sim + config.w_overlap * overlap_norm).astype(np.float32)
+    # Named entity (character) flow feature.
+    entity_score = np.zeros((n, n), dtype=np.float32)
+    if characters and config.w_entity > 0:
+        entity_score = character_flow_matrix(
+            texts,
+            characters,
+            tail_words=config.entity_window,
+            head_words=config.entity_window,
+        )
+
+    cheap = (config.w_emb * sim + config.w_overlap * overlap_norm + config.w_entity * entity_score).astype(np.float32)
 
     # Optional end bonus: encourage the last page in this bucket to transition
     # well into the next chapter anchor (or into Chapter I for the preface).
