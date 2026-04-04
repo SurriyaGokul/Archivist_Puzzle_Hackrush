@@ -22,6 +22,7 @@ class Embedder:
     _st_model: object | None = None
     _tfidf: object | None = None
     _warned_fallback: bool = False
+    _warned_transformers: bool = False
     _hf_tok: object | None = None
     _hf_model: object | None = None
 
@@ -89,6 +90,15 @@ class Embedder:
             self._hf_model = AutoModel.from_pretrained(self.model_name)
             self._hf_model.eval()
             self._hf_model.to(device)
+
+            if not self._warned_transformers:
+                self._warned_transformers = True
+                import sys
+
+                print(
+                    f"[archivist] Using Transformers embedder for '{self.model_name}' on device '{device}'",
+                    file=sys.stderr,
+                )
 
             # Speed/memory: fp16 on CUDA is usually fine for embedding models.
             if device != "cpu":
