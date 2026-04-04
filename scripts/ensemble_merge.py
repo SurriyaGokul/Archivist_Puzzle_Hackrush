@@ -117,7 +117,9 @@ def _kemeny_consensus(orders: list[list[int]]) -> list[int]:
                 return big_m
             return int(round((w_max - float(majority[i, j])) * scale))
 
-        manager = pywrapcp.RoutingIndexManager(n_total, 1, start, end)
+        # OR-Tools Python API supports either (num_nodes, num_vehicles, depot)
+        # or (num_nodes, num_vehicles, starts, ends). We need distinct start/end.
+        manager = pywrapcp.RoutingIndexManager(n_total, 1, [start], [end])
         routing = pywrapcp.RoutingModel(manager)
 
         def cb(from_index: int, to_index: int) -> int:
