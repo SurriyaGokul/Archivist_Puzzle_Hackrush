@@ -1,0 +1,102 @@
+Background 
+In 1934, British crossword compiler Edward Powys Mathers, writing under the pseudonym Torquemada, published an extraordinary literary puzzle titled Cain’s Jawbone.
+The book consisted of 100 pages. Completely out of order. Readers were challenged to rearrange them correctly and, in doing so, identify six victims and their respective murderers hidden within the narrative.
+Despite being nearly a century old, the puzzle remains notoriously difficult. For decades, only two people were known to have solved it correctly after its original publication. In recent years, a small number of additional solvers have emerged, but the total remains extremely low given the number of attempts worldwide. The solution itself is still treated with a degree of secrecy, and the puzzle continues to be regarded as one of the most challenging literary enigmas ever created.
+What makes it so difficult is not just the disorder, but the subtlety of the clues. The correct sequence can only be inferred through:
+linguistic continuity
+character and object tracking
+temporal and causal reasoning
+careful interpretation of nuanced text
+Motivation
+Inspired by this historic challenge, we ask:
+Can machines reconstruct a narrative when its structure has been completely disrupted?
+In many real-world scenarios, information is fragmented. Logs are shuffled. Documents lose ordering. Context must be inferred. This problem mirrors those challenges in a controlled setting.
+You are placed in the role of an archivist tasked with restoring a lost narrative from disordered fragments.
+
+Problem Statement
+You are given collections of text fragments (“pages”) from mystery narratives. The original ordering has been removed.
+Your task is to:
+Reconstruct the correct sequence of pages using algorithmic or machine learning techniques.
+No explicit ordering cues are provided. The solution must emerge from understanding the text.
+
+Dataset Description
+Training Dataset
+You will be provided with a CSV file derived from:
+The Mysterious Affair at Styles
+This dataset is in correct order and contains:
+Column
+Description
+page
+Original page number
+text
+Text content of the page
+
+This dataset may be used to learn narrative flow and structure.
+
+Test Dataset
+You will be provided with two test CSV files. In both cases, the pages have been randomly shuffled.
+Each file contains:
+Column
+Description
+page
+Identifier corresponding to original page index
+text
+Text content (shuffled)
+
+The correct ordering is not provided.
+
+Objective
+For each test dataset, determine the correct ordering of pages.
+
+Submission Format
+You must submit two separate CSV files:
+BookA.csv
+BookB.csv
+A sample submission file (sample_submission.csv) has been provided for reference.
+Required Columns
+Each submission file must contain:
+Column
+Description
+original_page
+The correct position in the reconstructed sequence (1-based index)
+shuffled_page
+The page identifier from the provided test file
+
+
+Important Constraints
+Each file must represent a valid permutation
+Every page must appear exactly once
+No duplicates or missing pages
+Ordering must be 1-based and continuous
+
+Evaluation
+Submissions will be evaluated using a Kendall Tau-based score, which measures pairwise ordering correctness.
+Let:
+D = number of incorrectly ordered page pairs
+T = n(n − 1) / 2 = total number of pairs
+The Kendall Tau coefficient is:
+τ = 1 − (2D / T)
+The final normalized score is:
+Score = (τ + 1) / 2
+The final score is normalized to the range [0, 1]
+
+Final Score
+Final Score = 0.5 × Score(BookA) + 0.5 × Score(BookB)
+
+Rules
+Any algorithmic or machine learning approach is allowed
+Use of external open-sourced pretrained models is permitted
+Use of closed sourced models is not allowed.
+Manual reconstruction or use of known correct solutions is prohibited
+Every Team will be allowed a maximum of 15 valid submissions only. Only the team leader is allowed to submit for evaluation. 
+Only the best submission score is visible.
+Please save all your submissions locally.
+NOTE: Top 5 teams on the leaderboard will be asked to present their solution/strategy. If that does not adhere to the above guidelines, that solution will be discarded. Also the teams must be registered with valid Email ID, or else the submission will not be considered.
+Website link for evaluation : link
+
+Goal
+Somewhere within these fragments lies a coherent story.
+Your task is to reconstruct it.
+Checkpoint 1 : Register your team on the website and make a valid submission.
+Checkpoint2 : Submit a valid submission csv file to land in the top 5 teams on leaderboard. Submit a picture of the leaderboard.
+Website link for evaluation (Every team has 15 submissions) : link
