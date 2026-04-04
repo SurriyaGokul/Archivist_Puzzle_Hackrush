@@ -36,15 +36,21 @@ class SolverConfig:
     lm_device: str | None = None  # e.g. 'cuda', 'cpu', or None for auto
     lm_max_length: int = 512
     lm_separator: str = "\n\n"
+    lm_use_pmi: bool = False
 
     # Chapter bucketing.
-    assign_method: str = "spectral"  # spectral|nearest_anchor
+    assign_method: str = "spectral"  # spectral|spectral_dp|nearest_anchor
     spectral_knn: int = 12
+    assign_dp_penalty: float = 0.15
 
     # Path solving.
     solve_method: str = "ortools"  # ortools|beam|greedy
     ortools_time_limit_sec: int = 10
     beam_width: int = 10
+
+    # Local refinement (improves small inversions without changing global buckets).
+    refine_window: int = 0  # 0 disables; typical 6-10
+    refine_passes: int = 1
 
     # Repro.
     seed: int = 42

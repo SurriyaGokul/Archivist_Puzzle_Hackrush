@@ -43,12 +43,18 @@ def solve_pages(pages: list[Page], *, config: SolverConfig, cache_dir: str | Pat
 
     # Bucketing.
     if anchors_sorted:
+        next_anchor_by_chapter: dict[int, int | None] = {}
+        for i, a in enumerate(anchors_sorted):
+            next_anchor_by_chapter[a.chapter_num] = anchors_sorted[i + 1].page_id if i + 1 < len(anchors_sorted) else None
+        first_anchor_page_id = anchors_sorted[0].page_id
+
         buckets = _assign_to_chapters_spectral(
             pages,
             anchors_sorted,
             full_emb,
             method=config.assign_method,
             knn=config.spectral_knn,
+            dp_penalty=config.assign_dp_penalty,
         )
         ordered_chapter_keys: list[int | str] = ["__pre__", *[a.chapter_num for a in anchors_sorted], "__post__"]
     else:
@@ -81,12 +87,15 @@ def solve_pages(pages: list[Page], *, config: SolverConfig, cache_dir: str | Pat
 
         if isinstance(key, int):
             anchor_page_id = next((a.page_id for a in anchors_sorted if a.chapter_num == key), None)
+            end_target_page_id = next_anchor_by_chapter.get(key)
         else:
             anchor_page_id = None
+            end_target_page_id = first_anchor_page_id if key == "__pre__" and anchors_sorted else None
 
         seq = _order_bucket(
             page_ids,
             anchor_page_id=anchor_page_id,
+            end_target_page_id=end_target_page_id,
             id_to_idx=id_to_idx,
             head_text=head_text,
             tail_text=tail_text,
@@ -115,6 +124,7 @@ def _assign_to_chapters_spectral(
     *,
     method: str,
     knn: int,
+    dp_penalty: float,
 ) -> dict[int | str, list[int]]:
     """Assign each page to a chapter bucket.
 
@@ -125,7 +135,7 @@ def _assign_to_chapters_spectral(
     for a in anchors:
         buckets[a.chapter_num] = []
 
-    if method not in {"spectral", "nearest_anchor"}:
+    if method not in {"spectral", "spectral_dp", "nearest_anchor"}:
         method = "spectral"
 
     if method == "nearest_anchor":
@@ -175,6 +185,98 @@ def _assign_to_chapters_spectral(
 
     anchor_fit_list = [float(x) for x in anchor_fit]
 
+    if method == "spectral_dp":
+        # DP assignment along the spectral coordinate with a mild penalty for
+        # deviating from the coordinate-derived chapter.
+        page_ids = [p.page_id for p in pages]
+        id_to_pos = {pid: i for i, pid in enumerate(page_ids)}
+        anchor_ids_set = {a.page_id for a in anchors}
+        anchor_pos = [id_to_pos[a.page_id] for a in anchors]
+
+        anchor_emb = full_emb[anchor_pos]
+        sim_to_anchor = (full_emb @ anchor_emb.T).astype(np.float32)  # (N,K)
+
+        # Sort pages by coordinate.
+        order = list(np.argsort(coord))
+
+        pre_ids: list[int] = []
+        dp_indices: list[int] = []
+        for i in order:
+            i = int(i)
+            pid = pages[i].page_id
+            c = float(coord[i])
+            if c < anchor_fit_list[0] and pid not in anchor_ids_set:
+                pre_ids.append(pid)
+            else:
+                dp_indices.append(i)
+
+        k_ch = len(anchors)
+        fixed_label: dict[int, int] = {a.page_id: idx for idx, a in enumerate(anchors)}
+        penalty = float(dp_penalty)
+
+        def base_label(c: float) -> int:
+            b = bisect.bisect_right(anchor_fit_list, c) - 1
+            return int(max(0, min(k_ch - 1, b)))
+
+        n2 = len(dp_indices)
+        dp = np.full((n2, k_ch), -np.inf, dtype=np.float32)
+        back = np.full((n2, k_ch), -1, dtype=np.int16)
+
+        for t, i in enumerate(dp_indices):
+            pid = pages[i].page_id
+            b = base_label(float(coord[i]))
+            scores = sim_to_anchor[i].copy()
+            if penalty > 0:
+                for r in range(k_ch):
+                    scores[r] -= penalty * float(abs(r - b))
+
+            if pid in fixed_label:
+                r_fix = fixed_label[pid]
+                masked = np.full(k_ch, -np.inf, dtype=np.float32)
+                masked[r_fix] = scores[r_fix]
+                scores = masked
+
+            if t == 0:
+                dp[t] = scores
+                continue
+
+            prev = dp[t - 1]
+            best_val = -np.inf
+            best_idx = -1
+            for r in range(k_ch):
+                if float(prev[r]) > best_val:
+                    best_val = float(prev[r])
+                    best_idx = r
+                if np.isfinite(scores[r]) and np.isfinite(best_val):
+                    dp[t, r] = scores[r] + best_val
+                    back[t, r] = best_idx
+
+        last_r = int(np.argmax(dp[n2 - 1]))
+        labels_by_index: dict[int, int] = {}
+        r = last_r
+        for t in range(n2 - 1, -1, -1):
+            i = dp_indices[t]
+            labels_by_index[i] = int(r)
+            if t > 0:
+                r = int(back[t, r])
+
+        pre_set = set(pre_ids)
+        buckets["__pre__"] = pre_ids
+        for i, p in enumerate(pages):
+            if p.page_id in pre_set:
+                continue
+            if p.page_id in anchor_ids_set:
+                chap = next(a.chapter_num for a in anchors if a.page_id == p.page_id)
+                buckets[chap].append(p.page_id)
+                continue
+            lab = labels_by_index.get(i)
+            if lab is None:
+                lab = base_label(float(coord[i]))
+            chap = anchors[int(lab)].chapter_num
+            buckets[chap].append(p.page_id)
+
+        return buckets
+
     for p in pages:
         c = id_to_coord[p.page_id]
         if p.page_id in anchor_ids:
@@ -196,6 +298,7 @@ def _order_bucket(
     page_ids: list[int],
     *,
     anchor_page_id: int | None,
+    end_target_page_id: int | None,
     id_to_idx: dict[int, int],
     head_text: list[str],
     tail_text: list[str],
@@ -243,6 +346,97 @@ def _order_bucket(
 
     cheap = (config.w_emb * sim + config.w_overlap * overlap_norm).astype(np.float32)
 
+    # Optional end bonus: encourage the last page in this bucket to transition
+    # well into the next chapter anchor (or into Chapter I for the preface).
+    end_bonus: np.ndarray | None = None
+    if end_target_page_id is not None and end_target_page_id in id_to_idx:
+        tgt_global = id_to_idx[end_target_page_id]
+        tgt_head_text = head_text[tgt_global]
+
+        end_sim = (tail_emb[local_idx] @ head_emb[tgt_global]).astype(np.float32)
+
+        # Exact boundary overlap from each page -> target.
+        ow = max(1, int(config.overlap_words))
+        mo = max(1, int(config.max_overlap))
+        tgt_words = normalize_text(full_text[tgt_global]).lower().split()
+        tgt_prefix = tgt_words[:ow]
+        end_overlap = np.zeros(n, dtype=np.float32)
+        if tgt_prefix:
+            for ii, gi in enumerate(local_idx):
+                s_words = normalize_text(full_text[gi]).lower().split()
+                s_suffix = s_words[-ow:]
+                if not s_suffix:
+                    continue
+                kmax = min(mo, len(s_suffix), len(tgt_prefix))
+                best = 0
+                for k2 in range(kmax, 0, -1):
+                    if s_suffix[-k2:] == tgt_prefix[:k2]:
+                        best = k2
+                        break
+                end_overlap[ii] = float(best)
+
+        if config.max_overlap > 0:
+            end_overlap = end_overlap / float(config.max_overlap)
+
+        end_bonus = (config.w_emb * end_sim + config.w_overlap * end_overlap).astype(np.float32)
+
+        if scorers:
+            import hashlib
+
+            def edge_key(prefix: str, separator: str, target: str) -> str:
+                s = (prefix or "").strip() + "\u0000" + separator + "\u0000" + (target or "").strip()
+                return hashlib.blake2b(s.encode("utf-8"), digest_size=16).hexdigest()
+
+            prefixes_end = [tail_text[gi] for gi in local_idx]
+            targets_end = [tgt_head_text] * n
+            keys_end = [edge_key(p, config.lm_separator, t) for p, t in zip(prefixes_end, targets_end, strict=True)]
+
+            # Baseline for PMI (target unconditional).
+            base_key = edge_key("", config.lm_separator, tgt_head_text)
+
+            total_end = np.zeros(n, dtype=np.float32)
+            for scorer in scorers:
+                model_name = scorer.cfg.model_name
+                kind = f"lm_ml{int(config.lm_max_length)}"
+
+                cached = cache.get_many(kind=kind, model=model_name, keys=keys_end)
+                missing = [k for k, kk in enumerate(keys_end) if kk not in cached]
+                if missing:
+                    miss_pref = [prefixes_end[k] for k in missing]
+                    miss_tgt = [targets_end[k] for k in missing]
+                    scores = scorer.score_pairs(
+                        miss_pref,
+                        miss_tgt,
+                        batch_size=config.lm_batch_size,
+                        separator=config.lm_separator,
+                    )
+                    cache.set_many(
+                        kind=kind,
+                        model=model_name,
+                        entries=[(keys_end[k], float(scores[i])) for i, k in enumerate(missing)],
+                    )
+                    for i, k in enumerate(missing):
+                        cached[keys_end[k]] = float(scores[i])
+
+                cond = np.array([cached[kk] for kk in keys_end], dtype=np.float32)
+
+                if config.lm_use_pmi:
+                    base = cache.get_many(kind=kind, model=model_name, keys=[base_key])
+                    if base_key not in base:
+                        s0 = scorer.score_pairs(
+                            [""],
+                            [tgt_head_text],
+                            batch_size=1,
+                            separator=config.lm_separator,
+                        )[0]
+                        cache.set_many(kind=kind, model=model_name, entries=[(base_key, float(s0))])
+                        base[base_key] = float(s0)
+                    cond = cond - float(base[base_key])
+
+                total_end += cond
+
+            end_bonus = end_bonus + (config.w_lm * (total_end / float(len(scorers)))).astype(np.float32)
+
     # LM feature (optional).
     lm_scores = np.zeros((n, n), dtype=np.float32)
     if scorers:
@@ -274,11 +468,38 @@ def _order_bucket(
         targets = [head_text[local_idx[j]] for _, j in edges]
         keys = [edge_key(p, config.lm_separator, t) for p, t in zip(prefixes, targets, strict=True)]
 
+        base_targets = [head_text[local_idx[j]] for j in range(n)]
+        base_keys = [edge_key("", config.lm_separator, t) for t in base_targets]
+        tgt_idx = np.array([j for _, j in edges], dtype=np.int32)
+
         # For multiple LMs, average their scores.
         total = np.zeros(len(edges), dtype=np.float32)
         for scorer in scorers:
             model_name = scorer.cfg.model_name
             kind = f"lm_ml{int(config.lm_max_length)}"
+
+            baseline: np.ndarray | None = None
+            if config.lm_use_pmi:
+                cached_base = cache.get_many(kind=kind, model=model_name, keys=base_keys)
+                missing_base = [j for j, k in enumerate(base_keys) if k not in cached_base]
+                if missing_base:
+                    miss_pref = [""] * len(missing_base)
+                    miss_tgt = [base_targets[j] for j in missing_base]
+                    scores = scorer.score_pairs(
+                        miss_pref,
+                        miss_tgt,
+                        batch_size=config.lm_batch_size,
+                        separator=config.lm_separator,
+                    )
+                    cache.set_many(
+                        kind=kind,
+                        model=model_name,
+                        entries=[(base_keys[j], float(scores[i])) for i, j in enumerate(missing_base)],
+                    )
+                    for i, j in enumerate(missing_base):
+                        cached_base[base_keys[j]] = float(scores[i])
+                baseline = np.array([cached_base[k] for k in base_keys], dtype=np.float32)
+
             cached = cache.get_many(kind=kind, model=model_name, keys=keys)
 
             missing_idx = [k for k, key in enumerate(keys) if key not in cached]
@@ -299,7 +520,10 @@ def _order_bucket(
                 for i, k in enumerate(missing_idx):
                     cached[keys[k]] = float(scores[i])
 
-            total += np.array([cached[k] for k in keys], dtype=np.float32)
+            cond = np.array([cached[k] for k in keys], dtype=np.float32)
+            if baseline is not None:
+                cond = cond - baseline[tgt_idx]
+            total += cond
 
         avg = total / float(len(scorers))
         for (i, j), s in zip(edges, avg, strict=True):
@@ -314,15 +538,151 @@ def _order_bucket(
 
     # Solve.
     if config.solve_method == "greedy":
-        return _greedy_path(local_ids, w, start=start_local)
-    if config.solve_method == "beam":
-        return _beam_path(local_ids, w, start=start_local, beam_width=config.beam_width)
+        seq = _greedy_path(local_ids, w, start=start_local)
+    elif config.solve_method == "beam":
+        seq = _beam_path(local_ids, w, start=start_local, beam_width=config.beam_width, end_bonus=end_bonus)
+    else:
+        # Default: OR-Tools.
+        try:
+            seq = _ortools_path(
+                local_ids,
+                w,
+                start=start_local,
+                time_limit_sec=config.ortools_time_limit_sec,
+                end_bonus=end_bonus,
+            )
+        except Exception:
+            seq = _beam_path(local_ids, w, start=start_local, beam_width=config.beam_width, end_bonus=end_bonus)
 
-    # Default: OR-Tools.
-    try:
-        return _ortools_path(local_ids, w, start=start_local, time_limit_sec=config.ortools_time_limit_sec)
-    except Exception:
-        return _beam_path(local_ids, w, start=start_local, beam_width=config.beam_width)
+    # Optional local refinement.
+    if int(config.refine_window) > 0 and len(seq) >= 3:
+        fixed_prefix = 1 if (anchor_page_id is not None and seq and seq[0] == anchor_page_id) else 0
+        id_to_local = {pid: i for i, pid in enumerate(local_ids)}
+        path_idx = [id_to_local[pid] for pid in seq]
+        path_idx = _refine_sliding_window(
+            path_idx,
+            w,
+            window=int(config.refine_window),
+            passes=int(max(1, config.refine_passes)),
+            fixed_prefix=fixed_prefix,
+        )
+        seq = [local_ids[i] for i in path_idx]
+
+    return seq
+
+
+def _refine_sliding_window(
+    path: list[int],
+    w: np.ndarray,
+    *,
+    window: int,
+    passes: int,
+    fixed_prefix: int,
+) -> list[int]:
+    n = len(path)
+    window = int(window)
+    if window <= 2 or n <= window:
+        return path
+
+    fixed_prefix = int(max(0, fixed_prefix))
+    passes = int(max(1, passes))
+
+    def score_path(p: list[int]) -> float:
+        s = 0.0
+        for a, b in zip(p, p[1:]):
+            s += float(w[a, b])
+        return s
+
+    for _ in range(passes):
+        improved = False
+        for start in range(fixed_prefix, n - window + 1):
+            win = path[start : start + window]
+            prev = path[start - 1] if start > 0 else None
+            nxt = path[start + window] if start + window < n else None
+
+            old_score = 0.0
+            if prev is not None:
+                old_score += float(w[prev, win[0]])
+            old_score += score_path(win)
+            if nxt is not None:
+                old_score += float(w[win[-1], nxt])
+
+            new_win = _best_window_order(win, w, prev=prev, nxt=nxt)
+            if new_win == win:
+                continue
+
+            new_score = 0.0
+            if prev is not None:
+                new_score += float(w[prev, new_win[0]])
+            new_score += score_path(new_win)
+            if nxt is not None:
+                new_score += float(w[new_win[-1], nxt])
+
+            if new_score > old_score + 1e-6:
+                path[start : start + window] = new_win
+                improved = True
+
+        if not improved:
+            break
+
+    return path
+
+
+def _best_window_order(win: list[int], w: np.ndarray, *, prev: int | None, nxt: int | None) -> list[int]:
+    # Exact DP for best permutation of `win` given optional fixed neighbors prev/nxt.
+    m = len(win)
+    if m <= 2:
+        return win
+
+    size = 1 << m
+    dp = np.full((size, m), -np.inf, dtype=np.float32)
+    parent = np.full((size, m), -1, dtype=np.int16)
+
+    for j in range(m):
+        start_score = float(w[prev, win[j]]) if prev is not None else 0.0
+        dp[1 << j, j] = start_score
+
+    for mask in range(size):
+        for last in range(m):
+            cur = float(dp[mask, last])
+            if not np.isfinite(cur):
+                continue
+            for j in range(m):
+                if mask & (1 << j):
+                    continue
+                nmask = mask | (1 << j)
+                cand = cur + float(w[win[last], win[j]])
+                if cand > float(dp[nmask, j]):
+                    dp[nmask, j] = cand
+                    parent[nmask, j] = last
+
+    full = size - 1
+    best = -np.inf
+    best_last = 0
+    for last in range(m):
+        cur = float(dp[full, last])
+        if not np.isfinite(cur):
+            continue
+        if nxt is not None:
+            cur += float(w[win[last], nxt])
+        if cur > best:
+            best = cur
+            best_last = last
+
+    # Reconstruct.
+    out_idx: list[int] = []
+    mask = full
+    last = best_last
+    while True:
+        out_idx.append(last)
+        p = int(parent[mask, last])
+        mask = mask ^ (1 << last)
+        if mask == 0:
+            break
+        last = p
+
+    out_idx.reverse()
+    return [win[i] for i in out_idx]
 
 
 def _greedy_path(node_ids: list[int], w: np.ndarray, *, start: int) -> list[int]:
@@ -341,7 +701,14 @@ def _greedy_path(node_ids: list[int], w: np.ndarray, *, start: int) -> list[int]
     return [node_ids[i] for i in path]
 
 
-def _beam_path(node_ids: list[int], w: np.ndarray, *, start: int, beam_width: int) -> list[int]:
+def _beam_path(
+    node_ids: list[int],
+    w: np.ndarray,
+    *,
+    start: int,
+    beam_width: int,
+    end_bonus: np.ndarray | None = None,
+) -> list[int]:
     n = len(node_ids)
     beam_width = max(1, int(beam_width))
 
@@ -365,11 +732,21 @@ def _beam_path(node_ids: list[int], w: np.ndarray, *, start: int, beam_width: in
         new_states.sort(key=lambda x: x[0], reverse=True)
         states = new_states[:beam_width]
 
-    best = max(states, key=lambda x: x[0])
+    if end_bonus is None:
+        best = max(states, key=lambda x: x[0])
+    else:
+        best = max(states, key=lambda x: x[0] + float(end_bonus[x[1][-1]]))
     return [node_ids[i] for i in best[1]]
 
 
-def _ortools_path(node_ids: list[int], w: np.ndarray, *, start: int, time_limit_sec: int) -> list[int]:
+def _ortools_path(
+    node_ids: list[int],
+    w: np.ndarray,
+    *,
+    start: int,
+    time_limit_sec: int,
+    end_bonus: np.ndarray | None = None,
+) -> list[int]:
     from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
     n = len(node_ids)
@@ -385,6 +762,11 @@ def _ortools_path(node_ids: list[int], w: np.ndarray, *, start: int, time_limit_
     if not np.isfinite(w_max) or not np.isfinite(w_min):
         w_max, w_min = 0.0, -1.0
 
+    if end_bonus is not None:
+        eb = end_bonus[np.isfinite(end_bonus)]
+        if eb.size:
+            w_max = max(w_max, float(np.max(eb)))
+
     scale = 10000.0
     big_m = int(1e9)
 
@@ -393,7 +775,12 @@ def _ortools_path(node_ids: list[int], w: np.ndarray, *, start: int, time_limit_
         if i == end:
             return big_m
         if j == end:
-            return 0
+            if end_bonus is None:
+                return 0
+            ww = float(end_bonus[i])
+            if not np.isfinite(ww):
+                return big_m
+            return int(round((w_max - ww) * scale))
         if i == j:
             return big_m
         ww = float(w[i, j])
