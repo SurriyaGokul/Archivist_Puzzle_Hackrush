@@ -241,6 +241,8 @@ def _order_bucket(
     else:
         overlap_norm = overlap
 
+    cheap = (config.w_emb * sim + config.w_overlap * overlap_norm).astype(np.float32)
+
     # LM feature (optional).
     lm_scores = np.zeros((n, n), dtype=np.float32)
     if scorers:
@@ -250,7 +252,24 @@ def _order_bucket(
             s = (prefix or "").strip() + "\u0000" + separator + "\u0000" + (target or "").strip()
             return hashlib.blake2b(s.encode("utf-8"), digest_size=16).hexdigest()
 
-        edges: list[tuple[int, int]] = [(i, j) for i in range(n) for j in range(n) if i != j]
+        top_k = int(config.top_k)
+        if top_k <= 0 or top_k >= n:
+            edges: list[tuple[int, int]] = [(i, j) for i in range(n) for j in range(n) if i != j]
+        else:
+            k = max(1, min(top_k, n - 1))
+            edges_set: dict[tuple[int, int], None] = {}
+            for i in range(n):
+                row = cheap[i].copy()
+                row[i] = -np.inf
+                # argpartition gives an unordered top-k; sort them after.
+                idx = np.argpartition(-row, k)[:k]
+                idx = idx[np.argsort(-row[idx])]
+                for j in idx:
+                    if i == int(j):
+                        continue
+                    edges_set[(i, int(j))] = None
+            edges = list(edges_set.keys())
+
         prefixes = [tail_text[local_idx[i]] for i, _ in edges]
         targets = [head_text[local_idx[j]] for _, j in edges]
         keys = [edge_key(p, config.lm_separator, t) for p, t in zip(prefixes, targets, strict=True)]
@@ -287,11 +306,7 @@ def _order_bucket(
             lm_scores[i, j] = float(s)
 
     # Combine into weights.
-    w = (
-        config.w_emb * sim
-        + config.w_overlap * overlap_norm
-        + (config.w_lm * lm_scores if scorers else 0.0)
-    ).astype(np.float32)
+    w = (cheap + (config.w_lm * lm_scores if scorers else 0.0)).astype(np.float32)
 
     if anchor_page_id is None:
         # Choose a plausible start node: strong overall outgoing coherence.
