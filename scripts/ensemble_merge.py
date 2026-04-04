@@ -63,92 +63,155 @@ def _borda_consensus(orders: list[list[int]]) -> list[int]:
     return sorted(pages, key=lambda pid: (rank_sum[pid], pid))
 
 
-def _kemeny_consensus(orders: list[list[int]]) -> list[int]:
-    """Kemeny-optimal consensus: minimize total Kendall tau distance to all inputs.
+def _kendall_inversions(order_a: list[int], order_b: list[int]) -> int:
+    """Return Kendall inversion count between two permutations.
 
-    Builds a pairwise majority matrix and solves it as a TSP using OR-Tools.
-    Falls back to Borda if OR-Tools unavailable.
+    Both lists must contain the same items exactly once.
     """
+
+    if len(order_a) != len(order_b):
+        raise ValueError("Orders must have the same length")
+
+    n = len(order_a)
+    pos = {pid: i for i, pid in enumerate(order_b)}
+    try:
+        arr = [pos[pid] for pid in order_a]
+    except KeyError as e:
+        raise ValueError("Orders must contain the same page ids") from e
+
+    # Fenwick tree over positions 0..n-1.
+    bit = [0] * (n + 1)
+
+    def bit_add(i: int, delta: int) -> None:
+        while i <= n:
+            bit[i] += delta
+            i += i & -i
+
+    def bit_sum(i: int) -> int:
+        s = 0
+        while i > 0:
+            s += bit[i]
+            i -= i & -i
+        return s
+
+    inv = 0
+    seen = 0
+    for x in arr:
+        i = x + 1
+        leq = bit_sum(i)
+        inv += seen - leq
+        bit_add(i, 1)
+        seen += 1
+
+    return inv
+
+
+def _total_kendall_inversions(candidate: list[int], orders: list[list[int]]) -> int:
+    return sum(_kendall_inversions(candidate, o) for o in orders)
+
+
+def _kemeny_insert_heuristic(orders: list[list[int]]) -> list[int]:
+    """Heuristic for (approx) Kemeny median using pairwise preferences.
+
+    - Build pairwise matrix M[a,b] = #orders where a precedes b.
+    - Construct a permutation by inserting items (Borda seed) at the position
+      that maximizes incremental agreement.
+    - Apply a few adjacent-swap improvement passes.
+    """
+
     if not orders:
         raise ValueError("No orders provided")
 
     n = len(orders[0])
     pages = sorted(set(orders[0]))
-    pid_to_idx = {pid: i for i, pid in enumerate(pages)}
+    if len(pages) != n:
+        raise ValueError("Orders must be permutations (no duplicates)")
 
     for o in orders:
         if len(o) != n or set(o) != set(pages):
             raise ValueError("All orders must be permutations of the same page set")
 
-    # Build pairwise majority matrix: M[i,j] = number of orders where page i precedes page j.
+    pid_to_idx = {pid: i for i, pid in enumerate(pages)}
+
     import numpy as np
 
-    majority = np.zeros((n, n), dtype=np.float32)
+    majority = np.zeros((n, n), dtype=np.int16)
     for o in orders:
-        pos = {pid: r for r, pid in enumerate(o)}
+        pos = np.empty(n, dtype=np.int32)
+        for r, pid in enumerate(o):
+            pos[pid_to_idx[pid]] = r
         for i in range(n):
             for j in range(i + 1, n):
-                pi, pj = pages[i], pages[j]
-                if pos[pi] < pos[pj]:
-                    majority[i, j] += 1.0
+                if pos[i] < pos[j]:
+                    majority[i, j] += 1
                 else:
-                    majority[j, i] += 1.0
+                    majority[j, i] += 1
 
-    # Use majority as edge weights and solve TSP to find the ordering
-    # that maximizes agreement with the majority of input orderings.
-    try:
-        from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+    seed = _borda_consensus(orders)
+    perm_idx: list[int] = []
+    for pid in seed:
+        x = pid_to_idx[pid]
 
-        # Find best start: node with highest total outgoing majority.
-        start = int(np.argmax(majority.sum(axis=1)))
+        # Score for inserting x at each position k.
+        # k=0 => x before all existing => sum majority[x, y]
+        after = int(sum(int(majority[x, y]) for y in perm_idx))
+        before = 0
+        best_score = before + after
+        best_k = 0
 
-        end = n
-        n_total = n + 1
-        w_max = float(np.max(majority))
-        scale = 10000.0
+        for k, y in enumerate(perm_idx):
+            before += int(majority[y, x])
+            after -= int(majority[x, y])
+            score = before + after
+            if score > best_score:
+                best_score = score
+                best_k = k + 1
 
-        def cost(i: int, j: int) -> int:
-            big_m = int(1e9)
-            if i == end:
-                return big_m
-            if j == end:
-                return 0
-            if i == j:
-                return big_m
-            return int(round((w_max - float(majority[i, j])) * scale))
+        perm_idx.insert(best_k, x)
 
-        # OR-Tools Python API supports either (num_nodes, num_vehicles, depot)
-        # or (num_nodes, num_vehicles, starts, ends). We need distinct start/end.
-        manager = pywrapcp.RoutingIndexManager(n_total, 1, [start], [end])
-        routing = pywrapcp.RoutingModel(manager)
+    # A few adjacent-swap improvement passes.
+    for _ in range(min(2 * n, 500)):
+        swapped = False
+        for k in range(n - 1):
+            a = perm_idx[k]
+            b = perm_idx[k + 1]
+            if int(majority[b, a]) > int(majority[a, b]):
+                perm_idx[k], perm_idx[k + 1] = b, a
+                swapped = True
+        if not swapped:
+            break
 
-        def cb(from_index: int, to_index: int) -> int:
-            return cost(manager.IndexToNode(from_index), manager.IndexToNode(to_index))
+    return [pages[i] for i in perm_idx]
 
-        transit_cb = routing.RegisterTransitCallback(cb)
-        routing.SetArcCostEvaluatorOfAllVehicles(transit_cb)
 
-        params = pywrapcp.DefaultRoutingSearchParameters()
-        params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-        params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-        params.time_limit.seconds = 30
+def _kemeny_consensus(orders: list[list[int]]) -> list[int]:
+    """Approximate Kemeny consensus (minimize total Kendall distance).
 
-        solution = routing.SolveWithParameters(params)
-        if solution is None:
-            return _borda_consensus(orders)
+    NOTE: A previous OR-Tools/TSP formulation was fragile (API differences) and
+    can produce very poor consensus because it only scores *adjacent* pairs.
+    This implementation uses a safer, pairwise-preference heuristic and then
+    selects the best candidate by directly minimizing total Kendall inversions
+    to the input permutations.
+    """
 
-        index = routing.Start(0)
-        route: list[int] = []
-        while not routing.IsEnd(index):
-            node = manager.IndexToNode(index)
-            if node != end:
-                route.append(node)
-            index = solution.Value(routing.NextVar(index))
+    if not orders:
+        raise ValueError("No orders provided")
 
-        return [pages[i] for i in route]
+    if len(orders) == 1:
+        return list(orders[0])
 
-    except ImportError:
-        return _borda_consensus(orders)
+    # For exactly two inputs, Borda/average-rank is already a Kemeny-optimal median
+    # (it preserves all pairwise agreements between the two permutations).
+    borda = _borda_consensus(orders)
+    if len(orders) == 2:
+        return borda
+
+    # Heuristic candidate + robust selection among safe candidates.
+    heuristic = _kemeny_insert_heuristic(orders)
+    candidates: list[list[int]] = [heuristic, borda, *[list(o) for o in orders]]
+
+    best = min(candidates, key=lambda c: _total_kendall_inversions(c, orders))
+    return best
 
 
 def main() -> None:

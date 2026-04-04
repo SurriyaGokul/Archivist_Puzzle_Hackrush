@@ -1082,7 +1082,9 @@ def _ortools_path(
             return big_m
         return int(round((w_max - ww) * scale))
 
-    manager = pywrapcp.RoutingIndexManager(n_total, 1, start, end)
+    # OR-Tools Python API supports either (num_nodes, num_vehicles, depot)
+    # or (num_nodes, num_vehicles, starts, ends). We need distinct start/end.
+    manager = pywrapcp.RoutingIndexManager(n_total, 1, [int(start)], [int(end)])
     routing = pywrapcp.RoutingModel(manager)
 
     def cb(from_index: int, to_index: int) -> int:
