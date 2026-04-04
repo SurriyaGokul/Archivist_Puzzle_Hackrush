@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -68,7 +69,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--runs", type=int, default=3, help="Number of random shuffles")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out_json", help="Optional path to write eval summary")
-    return p.parse_args()
+
+    argv = sys.argv[1:]
+    cleaned = [a for a in argv if a.strip()]
+    if len(cleaned) != len(argv):
+        print(
+            "Warning: Ignoring whitespace-only CLI arguments. "
+            "If you used multi-line flags, ensure each line-continuation \\ is the LAST character on the line (no trailing spaces).",
+            file=sys.stderr,
+        )
+    return p.parse_args(cleaned)
 
 
 def run_eval(train_csv: str | Path, *, config: SolverConfig, runs: int, seed: int) -> list[EvalResult]:
