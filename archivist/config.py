@@ -53,7 +53,8 @@ class SolverConfig:
     assign_method: str = "nearest_anchor"  # spectral|spectral_dp|nearest_anchor
     spectral_knn: int = 12
     assign_dp_penalty: float = 0.15
-    assign_balance: bool = True  # enforce balanced chapter sizes
+    assign_balance: bool = True  # enforce a soft max chapter size (avoid pathological huge buckets)
+    assign_balance_min_size: bool = False  # also enforce a minimum chapter size (more aggressive)
 
     # Path solving.
     solve_method: str = "ortools"  # ortools|beam|greedy

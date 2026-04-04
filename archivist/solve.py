@@ -61,6 +61,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--rerank_device", help="Force reranker device (e.g. 'cuda' or 'cpu')")
     p.add_argument("--w_rerank", type=float, help="Weight for reranker feature")
 
+    p.add_argument(
+        "--balance_min_size",
+        action="store_true",
+        help="Also enforce a minimum chapter size when balancing (more aggressive; default off)",
+    )
+
     p.add_argument("--refine_window", type=int, help="Sliding-window exact refinement (0 disables)")
     p.add_argument("--refine_passes", type=int, help="Refinement passes")
 
@@ -129,6 +135,9 @@ def main() -> None:
         cfg.rerank_device = args.rerank_device
     if args.w_rerank is not None:
         cfg.w_rerank = float(args.w_rerank)
+
+    if args.balance_min_size:
+        cfg.assign_balance_min_size = True
 
     if args.refine_window is not None:
         cfg.refine_window = int(args.refine_window)

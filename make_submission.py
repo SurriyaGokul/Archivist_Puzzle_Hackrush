@@ -67,6 +67,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--w_entity", type=float, help="Weight for named-entity flow feature")
     p.add_argument("--entity_window", type=int, help="Words to scan at tail/head for entity detection")
     p.add_argument("--no_balance", action="store_true", help="Disable chapter balance enforcement")
+    p.add_argument(
+        "--balance_min_size",
+        action="store_true",
+        help="Also enforce a minimum chapter size when balancing (more aggressive; default off)",
+    )
 
     p.add_argument("--refine_window", type=int, help="Sliding-window exact refinement (0 disables)")
     p.add_argument("--refine_passes", type=int, help="Refinement passes")
@@ -145,6 +150,8 @@ def main() -> None:
         cfg.entity_window = int(args.entity_window)
     if args.no_balance:
         cfg.assign_balance = False
+    if args.balance_min_size:
+        cfg.assign_balance_min_size = True
 
     if args.refine_window is not None:
         cfg.refine_window = int(args.refine_window)
