@@ -186,6 +186,28 @@ def _assign_to_chapters_spectral(
     anchor_fit_list = [float(x) for x in anchor_fit]
 
     if method == "spectral_dp":
+        # The DP below assumes that chapter anchors appear in the same order as
+        # chapter numbers along the spectral coordinate. In practice, chapter-
+        # heading pages are stylistically similar and can cluster together,
+        # producing many anchor-coordinate inversions. When that happens, the
+        # monotone DP becomes infeasible and collapses assignments (e.g. most
+        # pages end up in '__pre__' or the last chapter).
+        #
+        # Guardrail: if anchors are not monotone along the coordinate, fall
+        # back to the robust 'nearest_anchor' bucketing.
+        if len(anchor_coords) >= 2:
+            inv = int(np.sum(anchor_coords[1:] < anchor_coords[:-1]))
+            if inv > 0:
+                return _assign_to_chapters_spectral(
+                    pages,
+                    anchors,
+                    full_emb,
+                    method="nearest_anchor",
+                    knn=knn,
+                    dp_penalty=dp_penalty,
+                )
+
+    if method == "spectral_dp":
         # DP assignment along the spectral coordinate with a mild penalty for
         # deviating from the coordinate-derived chapter.
         page_ids = [p.page_id for p in pages]
