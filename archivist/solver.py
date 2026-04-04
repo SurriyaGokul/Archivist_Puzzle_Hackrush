@@ -143,10 +143,15 @@ def _balance_buckets(
     full_emb: np.ndarray,
     anchors: list[Anchor],
 ) -> dict[int | str, list[int]]:
-    """Enforce balanced chapter sizes by moving outlier pages to neighbor chapters."""
+    """Enforce mildly balanced chapter sizes by moving pages between chapters.
+
+    This is a lightweight guardrail to avoid pathological bucketing (e.g. a
+    chapter receiving only its anchor page) while keeping the assignment mostly
+    local (prefer neighboring chapters).
+    """
 
     anchor_ids = {a.page_id for a in anchors}
-    chapter_keys = [k for k in buckets if isinstance(k, int)]
+    chapter_keys = sorted(k for k in buckets if isinstance(k, int))
     if len(chapter_keys) < 2:
         return buckets
 
@@ -154,63 +159,120 @@ def _balance_buckets(
 
     # Compute expected size (excluding anchors from the count).
     total_non_anchor = sum(
-        len([pid for pid in buckets.get(k, []) if pid not in anchor_ids])
-        for k in list(buckets.keys())
+        sum(1 for pid in buckets.get(k, []) if pid not in anchor_ids)
+        for k in chapter_keys
     )
     expected = total_non_anchor / max(1, len(chapter_keys))
     min_size = max(2, int(expected * 0.3))
-    max_size = int(expected * 2.5)
+    max_size = max(min_size, int(expected * 2.5))
 
-    for _ in range(10):
+    ck_to_i = {ck: i for i, ck in enumerate(chapter_keys)}
+
+    def _centroid(ck: int) -> np.ndarray:
+        pids = buckets.get(ck, [])
+        positions = [id_to_pos[pid] for pid in pids]
+        c = full_emb[positions].mean(axis=0).astype(np.float32)
+        denom = float(np.linalg.norm(c))
+        if denom > 1e-12:
+            c = c / denom
+        return c
+
+    def _neighbors(ck: int) -> list[int]:
+        i = ck_to_i[ck]
+        out: list[int] = []
+        if i - 1 >= 0:
+            out.append(chapter_keys[i - 1])
+        if i + 1 < len(chapter_keys):
+            out.append(chapter_keys[i + 1])
+        return out
+
+    for _ in range(15):
+        sizes = {ck: len(buckets.get(ck, [])) for ck in chapter_keys}
+        under = [ck for ck in chapter_keys if sizes[ck] < min_size]
+        over = [ck for ck in chapter_keys if sizes[ck] > max_size]
+        if not under and not over:
+            break
+
+        centroids = {ck: _centroid(ck) for ck in chapter_keys}
         changed = False
-        for ck in chapter_keys:
-            pids = buckets.get(ck, [])
-            if len(pids) <= max_size:
+
+        # 1) Fill undersized chapters first (preference: steal from neighbors).
+        for ck in under:
+            need = int(min_size - len(buckets.get(ck, [])))
+            if need <= 0:
                 continue
 
-            # Compute centroid of this chapter.
-            positions = [id_to_pos[pid] for pid in pids]
-            centroid = full_emb[positions].mean(axis=0, keepdims=True)
-            centroid = centroid / max(1e-12, float(np.linalg.norm(centroid)))
+            donors = [d for d in _neighbors(ck) if d != ck and len(buckets.get(d, [])) > min_size]
+            if not donors:
+                donors = [d for d in chapter_keys if d != ck and len(buckets.get(d, [])) > min_size]
+            if not donors:
+                continue
 
-            # Similarity of each page to centroid.
-            sims = (full_emb[positions] @ centroid.T).flatten()
+            c = centroids[ck]
+            candidates: list[tuple[float, int, int]] = []  # (sim_to_target, donor_ck, pid)
+            for d in donors:
+                for pid in buckets.get(d, []):
+                    if pid in anchor_ids:
+                        continue
+                    pos = id_to_pos[pid]
+                    s = float(full_emb[pos] @ c)
+                    candidates.append((s, d, pid))
 
-            # Sort non-anchor pages by similarity (ascending = furthest first).
-            candidates = [
-                (float(sims[i]), pids[i])
-                for i in range(len(pids))
-                if pids[i] not in anchor_ids
-            ]
-            candidates.sort()
+            candidates.sort(reverse=True)
 
-            # Move furthest pages to nearest undersized neighbor.
-            overflow = len(pids) - max_size
-            for _, pid in candidates[:overflow]:
+            for _, d, pid in candidates:
+                if need <= 0:
+                    break
+                if len(buckets.get(d, [])) <= min_size:
+                    continue
+                buckets[d].remove(pid)
+                buckets[ck].append(pid)
+                need -= 1
+                changed = True
+
+        # 2) Trim oversized chapters (preference: move to neighbors with capacity).
+        for ck in over:
+            while len(buckets.get(ck, [])) > max_size:
+                pids = buckets.get(ck, [])
+                if len(pids) <= min_size:
+                    break
+
+                c = _centroid(ck)
+                positions = [id_to_pos[pid] for pid in pids]
+                sims = (full_emb[positions] @ c.reshape(-1, 1)).flatten()
+                # Furthest non-anchor first.
+                candidates = [
+                    (float(sims[i]), pids[i])
+                    for i in range(len(pids))
+                    if pids[i] not in anchor_ids
+                ]
+                if not candidates:
+                    break
+                candidates.sort()  # ascending similarity
+                _, pid = candidates[0]
                 pos = id_to_pos[pid]
-                page_emb = full_emb[pos : pos + 1]
+                page_emb = full_emb[pos]
+
+                recipients = [r for r in _neighbors(ck) if len(buckets.get(r, [])) < max_size]
+                if not recipients:
+                    recipients = [r for r in chapter_keys if r != ck and len(buckets.get(r, [])) < max_size]
+                if not recipients:
+                    break
 
                 best_key = None
                 best_sim = -np.inf
-                for other_ck in chapter_keys:
-                    if other_ck == ck:
-                        continue
-                    if len(buckets.get(other_ck, [])) >= max_size:
-                        continue
-                    other_positions = [id_to_pos[p] for p in buckets.get(other_ck, [])]
-                    if not other_positions:
-                        continue
-                    other_centroid = full_emb[other_positions].mean(axis=0, keepdims=True)
-                    other_centroid = other_centroid / max(1e-12, float(np.linalg.norm(other_centroid)))
-                    s = float((page_emb @ other_centroid.T).item())
+                for r in recipients:
+                    s = float(page_emb @ centroids[r])
                     if s > best_sim:
                         best_sim = s
-                        best_key = other_ck
+                        best_key = r
 
-                if best_key is not None:
-                    buckets[ck].remove(pid)
-                    buckets[best_key].append(pid)
-                    changed = True
+                if best_key is None:
+                    break
+
+                buckets[ck].remove(pid)
+                buckets[best_key].append(pid)
+                changed = True
 
         if not changed:
             break
