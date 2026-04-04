@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
 
 import numpy as np
 
@@ -35,10 +34,33 @@ class LMScorer:
             "torch_dtype": torch_dtype,
             "low_cpu_mem_usage": True,
         }
-        if cfg.load_in_4bit:
-            kwargs["load_in_4bit"] = True
-        if cfg.load_in_8bit:
-            kwargs["load_in_8bit"] = True
+
+        # Quantization handling: newer Transformers uses `quantization_config`.
+        # Older versions accept `load_in_8bit`/`load_in_4bit` directly.
+        if cfg.load_in_4bit or cfg.load_in_8bit:
+            quant_kwargs: dict = {}
+            if cfg.load_in_4bit:
+                quant_kwargs.update(
+                    {
+                        "load_in_4bit": True,
+                        "bnb_4bit_compute_dtype": torch_dtype,
+                        "bnb_4bit_use_double_quant": True,
+                        "bnb_4bit_quant_type": "nf4",
+                    }
+                )
+            if cfg.load_in_8bit:
+                quant_kwargs["load_in_8bit"] = True
+
+            try:
+                from transformers import BitsAndBytesConfig
+
+                kwargs["quantization_config"] = BitsAndBytesConfig(**quant_kwargs)
+            except Exception:
+                # Fallback for older Transformers.
+                if cfg.load_in_4bit:
+                    kwargs["load_in_4bit"] = True
+                if cfg.load_in_8bit:
+                    kwargs["load_in_8bit"] = True
 
         if cfg.device is None:
             kwargs["device_map"] = "auto"
@@ -48,7 +70,39 @@ class LMScorer:
             kwargs["device_map"] = {"": cfg.device}
 
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, use_fast=True)
-        self.model = AutoModelForCausalLM.from_pretrained(cfg.model_name, **kwargs)
+
+        # If we hit a kwarg compatibility mismatch, retry once with the other scheme.
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(cfg.model_name, **kwargs)
+        except TypeError as e:
+            msg = str(e)
+            if ("load_in_8bit" in msg or "load_in_4bit" in msg) and (
+                cfg.load_in_4bit or cfg.load_in_8bit
+            ):
+                # Retry using quantization_config (modern path).
+                try:
+                    from transformers import BitsAndBytesConfig
+
+                    quant_kwargs = {}
+                    if cfg.load_in_4bit:
+                        quant_kwargs.update(
+                            {
+                                "load_in_4bit": True,
+                                "bnb_4bit_compute_dtype": torch_dtype,
+                                "bnb_4bit_use_double_quant": True,
+                                "bnb_4bit_quant_type": "nf4",
+                            }
+                        )
+                    if cfg.load_in_8bit:
+                        quant_kwargs["load_in_8bit"] = True
+                    kwargs.pop("load_in_4bit", None)
+                    kwargs.pop("load_in_8bit", None)
+                    kwargs["quantization_config"] = BitsAndBytesConfig(**quant_kwargs)
+                    self.model = AutoModelForCausalLM.from_pretrained(cfg.model_name, **kwargs)
+                except Exception:
+                    raise
+            else:
+                raise
         self.model.eval()
 
         self._torch = torch
