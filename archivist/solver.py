@@ -139,22 +139,67 @@ def _assign_to_chapters_spectral(
         method = "spectral"
 
     if method == "nearest_anchor":
-        # Nearest anchor by cosine similarity in full-text embedding space.
+        # Nearest-anchor assignment in cosine embedding space.
+        #
+        # Important: chapter-heading pages share boilerplate ("Chapter X"), which
+        # can make raw anchor embeddings overly similar. To make the assignment
+        # more robust, we do a tiny EM-like refinement:
+        #   1) assign pages to the closest anchor prototype
+        #   2) recompute a per-chapter prototype from assigned pages, while
+        #      keeping the original anchor embedding as an "anchor" prior.
         page_ids = [p.page_id for p in pages]
         id_to_pos = {pid: i for i, pid in enumerate(page_ids)}
-        anchor_ids = [a.page_id for a in anchors]
+
+        anchors_sorted = sorted(anchors, key=lambda a: a.chapter_num)
+        anchor_ids = [a.page_id for a in anchors_sorted]
         anchor_pos = [id_to_pos[pid] for pid in anchor_ids]
 
-        sim = full_emb @ full_emb[anchor_pos].T
+        anchor_emb = full_emb[anchor_pos].astype(np.float32)
+        proto = anchor_emb.copy()  # (K, D)
+
+        fixed_label: dict[int, int] = {a.page_id: idx for idx, a in enumerate(anchors_sorted)}
+        k_ch = len(anchors_sorted)
+
+        # Two lightweight refinement iterations are enough for this dataset size.
+        n_iter = 2
+        mix = 0.7  # weight of the data-driven centroid vs the anchor prior
+
+        assign = np.zeros(len(page_ids), dtype=np.int16)
+        for _ in range(n_iter):
+            sim = (full_emb @ proto.T).astype(np.float32)
+            for i, pid in enumerate(page_ids):
+                if pid in fixed_label:
+                    assign[i] = int(fixed_label[pid])
+                else:
+                    assign[i] = int(np.argmax(sim[i]))
+
+            new_proto = proto.copy()
+            for r in range(k_ch):
+                idxs = np.where(assign == r)[0]
+                if idxs.size == 0:
+                    new_proto[r] = anchor_emb[r]
+                    continue
+                mean = full_emb[idxs].mean(axis=0).astype(np.float32)
+                denom = float(np.linalg.norm(mean))
+                if denom > 1e-12:
+                    mean = mean / denom
+                v = ((1.0 - mix) * anchor_emb[r] + mix * mean).astype(np.float32)
+                denom2 = float(np.linalg.norm(v))
+                if denom2 > 1e-12:
+                    v = v / denom2
+                new_proto[r] = v
+
+            proto = new_proto
+
+        # Final assignment.
+        sim = (full_emb @ proto.T).astype(np.float32)
         for i, pid in enumerate(page_ids):
-            if pid in anchor_ids:
-                # Put anchor in its own chapter.
-                chap = next(a.chapter_num for a in anchors if a.page_id == pid)
-                buckets[chap].append(pid)
-                continue
-            best = int(np.argmax(sim[i]))
-            chap = anchors[best].chapter_num
+            if pid in fixed_label:
+                chap = anchors_sorted[int(fixed_label[pid])].chapter_num
+            else:
+                chap = anchors_sorted[int(np.argmax(sim[i]))].chapter_num
             buckets[chap].append(pid)
+
         return buckets
 
     # Spectral coordinate.
