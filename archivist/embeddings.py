@@ -21,6 +21,9 @@ class Embedder:
 
     _st_model: object | None = None
     _tfidf: object | None = None
+    _warned_fallback: bool = False
+    _hf_tok: object | None = None
+    _hf_model: object | None = None
 
     def encode(self, texts: list[str]) -> np.ndarray:
         """Return L2-normalized embeddings."""
@@ -44,10 +47,95 @@ class Embedder:
                 normalize_embeddings=True,
             )
             return np.asarray(emb, dtype=np.float32)
-        except Exception:
+        except Exception as e:
+            # If sentence-transformers isn't available, try a Transformers-based
+            # embedding path for common embedding models (e.g. BGE).
+            try:
+                return self._encode_transformers(texts)
+            except Exception:
+                pass
+
             # Fallback: TF-IDF (CPU, no downloads). We *cache the vectorizer* so
             # multiple encode() calls share a compatible feature space.
+            if not self._warned_fallback and self.model_name.strip().lower() != "tfidf":
+                self._warned_fallback = True
+                import sys
+
+                print(
+                    f"[archivist] WARNING: failed to load SentenceTransformer '{self.model_name}'. "
+                    f"Falling back to TF-IDF embeddings. Error: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
             return self._encode_tfidf(texts, fit_if_needed=True)
+
+    def _encode_transformers(self, texts: list[str]) -> np.ndarray:
+        """Embed texts using plain Transformers (no sentence-transformers).
+
+        This is a lightweight mean-pooling implementation that works well for
+        popular embedding checkpoints like BAAI/bge-large-en-v1.5.
+        """
+
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+
+        # Auto device: use GPU if available unless explicitly overridden.
+        device = self.device
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = str(device)
+
+        if self._hf_tok is None or self._hf_model is None:
+            self._hf_tok = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
+            self._hf_model = AutoModel.from_pretrained(self.model_name)
+            self._hf_model.eval()
+            self._hf_model.to(device)
+
+            # Speed/memory: fp16 on CUDA is usually fine for embedding models.
+            if device != "cpu":
+                try:
+                    self._hf_model.half()
+                except Exception:
+                    pass
+
+        tok = self._hf_tok
+        model = self._hf_model
+
+        batch_size = int(max(1, self.batch_size))
+        out: list[np.ndarray] = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = [str(t) for t in texts[i : i + batch_size]]
+            enc = tok(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="pt",
+            )
+            enc = {k: v.to(device) for k, v in enc.items()}
+
+            with torch.no_grad():
+                outputs = model(**enc)
+                last = outputs.last_hidden_state  # (B, T, H)
+
+                # Pooling: BGE models use CLS pooling; default to mean pooling.
+                name = self.model_name.lower()
+                use_cls = "bge" in name
+
+                mask = enc.get("attention_mask")
+                if use_cls or mask is None:
+                    emb = last[:, 0, :]
+                else:
+                    mask_f = mask.unsqueeze(-1).to(last.dtype)
+                    summed = (last * mask_f).sum(dim=1)
+                    denom = mask_f.sum(dim=1).clamp(min=1.0)
+                    emb = summed / denom
+
+            emb = emb.detach().cpu().to(torch.float32).numpy()
+            out.append(emb)
+
+        emb_all = np.vstack(out).astype(np.float32)
+        return _l2_normalize(emb_all)
 
     def _encode_tfidf(self, texts: list[str], *, fit_if_needed: bool) -> np.ndarray:
         try:

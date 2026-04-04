@@ -38,6 +38,13 @@ class SolverConfig:
     lm_separator: str = "\n\n"
     lm_use_pmi: bool = False
 
+    # Cross-encoder reranker (optional): pairwise coherence scoring.
+    rerank_models: list[str] = field(default_factory=list)
+    rerank_batch_size: int = 16
+    rerank_device: str | None = None
+    rerank_max_length: int = 512
+    w_rerank: float = 0.0
+
     # Chapter bucketing.
     assign_method: str = "spectral"  # spectral|spectral_dp|nearest_anchor
     spectral_knn: int = 12

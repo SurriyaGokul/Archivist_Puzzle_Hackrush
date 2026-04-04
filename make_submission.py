@@ -54,6 +54,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--lm_8bit", action="store_true", help="Load LM in 8-bit (if supported)")
     p.add_argument("--lm_device", help="Force LM device (e.g. 'cuda' or 'cpu')")
 
+    p.add_argument(
+        "--rerank_models",
+        default="",
+        help="Comma-separated cross-encoder reranker model ids (optional)",
+    )
+    p.add_argument("--rerank_batch_size", type=int, help="Reranker batch size")
+    p.add_argument("--rerank_max_length", type=int, help="Reranker max sequence length")
+    p.add_argument("--rerank_device", help="Force reranker device (e.g. 'cuda' or 'cpu')")
+    p.add_argument("--w_rerank", type=float, help="Weight for reranker feature")
+
     p.add_argument("--refine_window", type=int, help="Sliding-window exact refinement (0 disables)")
     p.add_argument("--refine_passes", type=int, help="Refinement passes")
 
@@ -113,6 +123,17 @@ def main() -> None:
         cfg.lm_load_in_8bit = True
     if args.lm_device:
         cfg.lm_device = args.lm_device
+
+    if args.rerank_models:
+        cfg.rerank_models = [m.strip() for m in args.rerank_models.split(",") if m.strip()]
+    if args.rerank_batch_size is not None:
+        cfg.rerank_batch_size = int(args.rerank_batch_size)
+    if args.rerank_max_length is not None:
+        cfg.rerank_max_length = int(args.rerank_max_length)
+    if args.rerank_device:
+        cfg.rerank_device = args.rerank_device
+    if args.w_rerank is not None:
+        cfg.w_rerank = float(args.w_rerank)
 
     if args.refine_window is not None:
         cfg.refine_window = int(args.refine_window)

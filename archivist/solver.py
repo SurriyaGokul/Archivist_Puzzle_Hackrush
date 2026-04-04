@@ -12,6 +12,7 @@ from archivist.data import normalize_text, word_window
 from archivist.embeddings import Embedder, cosine_sim_matrix, spectral_seriation
 from archivist.heuristics import boundary_overlap_matrix
 from archivist.lm import LMConfig, LMScorer
+from archivist.rerank import RerankConfig, Reranker
 from archivist.types import Anchor, Page
 
 
@@ -76,6 +77,17 @@ def solve_pages(pages: list[Page], *, config: SolverConfig, cache_dir: str | Pat
             )
             scorers.append(LMScorer(cfg))
 
+    # Cross-encoder rerankers.
+    rerankers: list[Reranker] = []
+    if config.rerank_models:
+        for m in config.rerank_models:
+            rcfg = RerankConfig(
+                model_name=m,
+                device=config.rerank_device,
+                max_length=config.rerank_max_length,
+            )
+            rerankers.append(Reranker(rcfg))
+
     cache = SQLiteScoreCache(Path(cache_dir) / "scores.sqlite")
 
     # Solve buckets in order and concatenate.
@@ -104,6 +116,7 @@ def solve_pages(pages: list[Page], *, config: SolverConfig, cache_dir: str | Pat
             full_text=full_text,
             config=config,
             scorers=scorers,
+            rerankers=rerankers,
             cache=cache,
         )
         out_order.extend(seq)
@@ -374,6 +387,7 @@ def _order_bucket(
     full_text: list[str],
     config: SolverConfig,
     scorers: list[LMScorer],
+    rerankers: list[Reranker],
     cache: SQLiteScoreCache,
 ) -> list[int]:
     # If bucket is trivial.
@@ -504,9 +518,11 @@ def _order_bucket(
 
             end_bonus = end_bonus + (config.w_lm * (total_end / float(len(scorers)))).astype(np.float32)
 
-    # LM feature (optional).
+    # LM and reranker features (optional).
+    # We use the same candidate edge set (controlled by `top_k`) for both.
     lm_scores = np.zeros((n, n), dtype=np.float32)
-    if scorers:
+    rr_scores = np.zeros((n, n), dtype=np.float32)
+    if scorers or rerankers:
         import hashlib
 
         def edge_key(prefix: str, separator: str, target: str) -> str:
@@ -533,25 +549,49 @@ def _order_bucket(
 
         prefixes = [tail_text[local_idx[i]] for i, _ in edges]
         targets = [head_text[local_idx[j]] for _, j in edges]
-        keys = [edge_key(p, config.lm_separator, t) for p, t in zip(prefixes, targets, strict=True)]
 
-        base_targets = [head_text[local_idx[j]] for j in range(n)]
-        base_keys = [edge_key("", config.lm_separator, t) for t in base_targets]
-        tgt_idx = np.array([j for _, j in edges], dtype=np.int32)
+        # LM scoring.
+        if scorers:
+            keys = [edge_key(p, config.lm_separator, t) for p, t in zip(prefixes, targets, strict=True)]
 
-        # For multiple LMs, average their scores.
-        total = np.zeros(len(edges), dtype=np.float32)
-        for scorer in scorers:
-            model_name = scorer.cfg.model_name
-            kind = f"lm_ml{int(config.lm_max_length)}"
+            base_targets = [head_text[local_idx[j]] for j in range(n)]
+            base_keys = [edge_key("", config.lm_separator, t) for t in base_targets]
+            tgt_idx = np.array([j for _, j in edges], dtype=np.int32)
 
-            baseline: np.ndarray | None = None
-            if config.lm_use_pmi:
-                cached_base = cache.get_many(kind=kind, model=model_name, keys=base_keys)
-                missing_base = [j for j, k in enumerate(base_keys) if k not in cached_base]
-                if missing_base:
-                    miss_pref = [""] * len(missing_base)
-                    miss_tgt = [base_targets[j] for j in missing_base]
+            # For multiple LMs, average their scores.
+            total = np.zeros(len(edges), dtype=np.float32)
+            for scorer in scorers:
+                model_name = scorer.cfg.model_name
+                kind = f"lm_ml{int(config.lm_max_length)}"
+
+                baseline: np.ndarray | None = None
+                if config.lm_use_pmi:
+                    cached_base = cache.get_many(kind=kind, model=model_name, keys=base_keys)
+                    missing_base = [j for j, k in enumerate(base_keys) if k not in cached_base]
+                    if missing_base:
+                        miss_pref = [""] * len(missing_base)
+                        miss_tgt = [base_targets[j] for j in missing_base]
+                        scores = scorer.score_pairs(
+                            miss_pref,
+                            miss_tgt,
+                            batch_size=config.lm_batch_size,
+                            separator=config.lm_separator,
+                        )
+                        cache.set_many(
+                            kind=kind,
+                            model=model_name,
+                            entries=[(base_keys[j], float(scores[i])) for i, j in enumerate(missing_base)],
+                        )
+                        for i, j in enumerate(missing_base):
+                            cached_base[base_keys[j]] = float(scores[i])
+                    baseline = np.array([cached_base[k] for k in base_keys], dtype=np.float32)
+
+                cached = cache.get_many(kind=kind, model=model_name, keys=keys)
+
+                missing_idx = [k for k, key in enumerate(keys) if key not in cached]
+                if missing_idx:
+                    miss_pref = [prefixes[k] for k in missing_idx]
+                    miss_tgt = [targets[k] for k in missing_idx]
                     scores = scorer.score_pairs(
                         miss_pref,
                         miss_tgt,
@@ -561,43 +601,57 @@ def _order_bucket(
                     cache.set_many(
                         kind=kind,
                         model=model_name,
-                        entries=[(base_keys[j], float(scores[i])) for i, j in enumerate(missing_base)],
+                        entries=[(keys[k], float(scores[i])) for i, k in enumerate(missing_idx)],
                     )
-                    for i, j in enumerate(missing_base):
-                        cached_base[base_keys[j]] = float(scores[i])
-                baseline = np.array([cached_base[k] for k in base_keys], dtype=np.float32)
+                    for i, k in enumerate(missing_idx):
+                        cached[keys[k]] = float(scores[i])
 
-            cached = cache.get_many(kind=kind, model=model_name, keys=keys)
+                cond = np.array([cached[k] for k in keys], dtype=np.float32)
+                if baseline is not None:
+                    cond = cond - baseline[tgt_idx]
+                total += cond
 
-            missing_idx = [k for k, key in enumerate(keys) if key not in cached]
-            if missing_idx:
-                miss_pref = [prefixes[k] for k in missing_idx]
-                miss_tgt = [targets[k] for k in missing_idx]
-                scores = scorer.score_pairs(
-                    miss_pref,
-                    miss_tgt,
-                    batch_size=config.lm_batch_size,
-                    separator=config.lm_separator,
-                )
-                cache.set_many(
-                    kind=kind,
-                    model=model_name,
-                    entries=[(keys[k], float(scores[i])) for i, k in enumerate(missing_idx)],
-                )
-                for i, k in enumerate(missing_idx):
-                    cached[keys[k]] = float(scores[i])
+            avg = total / float(len(scorers))
+            for (i, j), s in zip(edges, avg, strict=True):
+                lm_scores[i, j] = float(s)
 
-            cond = np.array([cached[k] for k in keys], dtype=np.float32)
-            if baseline is not None:
-                cond = cond - baseline[tgt_idx]
-            total += cond
+        # Cross-encoder reranker scoring.
+        if rerankers and float(config.w_rerank) != 0.0:
+            import hashlib
 
-        avg = total / float(len(scorers))
-        for (i, j), s in zip(edges, avg, strict=True):
-            lm_scores[i, j] = float(s)
+            def rr_key(left: str, right: str) -> str:
+                s = (left or "").strip() + "\u0000" + (right or "").strip()
+                return hashlib.blake2b(s.encode("utf-8"), digest_size=16).hexdigest()
+
+            rr_keys = [rr_key(p, t) for p, t in zip(prefixes, targets, strict=True)]
+
+            total_rr = np.zeros(len(edges), dtype=np.float32)
+            for rr in rerankers:
+                model_name = rr.cfg.model_name
+                kind = f"rr_ml{int(rr.cfg.max_length)}"
+                cached = cache.get_many(kind=kind, model=model_name, keys=rr_keys)
+                missing_idx = [k for k, key in enumerate(rr_keys) if key not in cached]
+                if missing_idx:
+                    miss_l = [prefixes[k] for k in missing_idx]
+                    miss_r = [targets[k] for k in missing_idx]
+                    scores = rr.score_pairs(miss_l, miss_r, batch_size=config.rerank_batch_size)
+                    cache.set_many(
+                        kind=kind,
+                        model=model_name,
+                        entries=[(rr_keys[k], float(scores[i])) for i, k in enumerate(missing_idx)],
+                    )
+                    for i, k in enumerate(missing_idx):
+                        cached[rr_keys[k]] = float(scores[i])
+
+                cond = np.array([cached[k] for k in rr_keys], dtype=np.float32)
+                total_rr += cond
+
+            avg_rr = total_rr / float(len(rerankers))
+            for (i, j), s in zip(edges, avg_rr, strict=True):
+                rr_scores[i, j] = float(s)
 
     # Combine into weights.
-    w = (cheap + (config.w_lm * lm_scores if scorers else 0.0)).astype(np.float32)
+    w = (cheap + (config.w_lm * lm_scores if scorers else 0.0) + (config.w_rerank * rr_scores)).astype(np.float32)
 
     if anchor_page_id is None:
         # Choose a plausible start node: strong overall outgoing coherence.
